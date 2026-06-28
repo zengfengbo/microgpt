@@ -34,7 +34,8 @@ const LEARNING_RATE: f64 = 0.01; // 学习率/learning rate
 const BETA1: f64 = 0.85;         // Adam 一阶动量系数/1st moment
 const BETA2: f64 = 0.99;         // Adam 二阶动量系数/2nd moment
 const EPS_ADAM: f64 = 1e-8;     // Adam 数值稳定项/numerical stability
-const NUM_STEPS: usize = 1000;  // 训练步数/training steps
+const DEFAULT_NUM_STEPS: usize = 300;  // 默认训练步数/default training steps
+const LOG_EVERY: usize = 10;           // 进度刷新间隔/progress interval
 const TEMPERATURE: f64 = 0.5;   // 采样温度/sampling temp, (0, 1] 低到高=低创造力到高创造力
 
 // ============================================================
@@ -57,6 +58,7 @@ fn load_docs(rng: &mut impl Rng) -> Vec<String> {
 // ============================================================
 struct Tokenizer {
     uchars: Vec<char>,
+    char_to_id: HashMap<char, usize>,
     bos: usize,
     vocab_size: usize,
 }
@@ -70,11 +72,17 @@ impl Tokenizer {
             }
         }
         let uchars: Vec<char> = char_set.into_iter().collect();
+        let char_to_id: HashMap<char, usize> = uchars
+            .iter()
+            .enumerate()
+            .map(|(i, &ch)| (ch, i))
+            .collect();
         let bos = uchars.len();
         let vocab_size = uchars.len() + 1;
         println!("词表大小/vocab size: {}", vocab_size);
         Tokenizer {
             uchars,
+            char_to_id,
             bos,
             vocab_size,
         }
@@ -83,7 +91,7 @@ impl Tokenizer {
     fn encode(&self, doc: &str) -> Vec<usize> {
         let mut tokens = vec![self.bos];
         for ch in doc.chars() {
-            tokens.push(self.uchars.iter().position(|&c| c == ch).unwrap());
+            tokens.push(self.char_to_id[&ch]);
         }
         tokens.push(self.bos);
         tokens
@@ -492,10 +500,39 @@ fn run_inference(sd: &HashMap<String, Matrix>, tok: &Tokenizer, rng: &mut impl R
 // ============================================================
 // 主函数
 // ============================================================
+fn print_help(program: &str) {
+    println!(
+        "\
+microgpt - minimal pure Rust GPT training and inference
+
+Usage:
+  {program}                      Train for {DEFAULT_NUM_STEPS} steps, save model.weights, then infer
+  {program} train [model] [steps] Train and save weights
+  {program} infer [model]         Run inference from saved weights
+  {program} help                  Show this help
+
+Examples:
+  {program} train model.weights 100
+  {program} infer model.weights
+"
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("");
+
+    if matches!(mode, "help" | "--help" | "-h") {
+        let program = args.first().map(|s| s.as_str()).unwrap_or("microgpt");
+        print_help(program);
+        return;
+    }
+
     let model_path = args.get(2).map(|s| s.as_str()).unwrap_or("model.weights");
+    let steps = args
+        .get(3)
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_NUM_STEPS);
 
     // Let there be order among chaos
     let mut rng = StdRng::seed_from_u64(42);
@@ -507,7 +544,7 @@ fn main() {
     match mode {
         "train" => {
             let sd = init_params(tok.vocab_size, &mut rng);
-            train_model(&sd, &docs, &tok);
+            train_model(&sd, &docs, &tok, steps);
             save_model(&sd, model_path);
         }
         "infer" => {
@@ -519,7 +556,7 @@ fn main() {
             // 默认: 训练 + 保存 + 推理
             let sd = init_params(tok.vocab_size, &mut rng);
             println!("参数总量/num params: {}", count_params(&sd));
-            train_model(&sd, &docs, &tok);
+            train_model(&sd, &docs, &tok, steps);
             save_model(&sd, model_path);
             let mut infer_rng = StdRng::seed_from_u64(1337);
             run_inference(&sd, &tok, &mut infer_rng);
@@ -531,7 +568,8 @@ fn count_params(sd: &HashMap<String, Matrix>) -> usize {
     sd.values().map(|mat| mat.iter().map(|row| row.len()).sum::<usize>()).sum()
 }
 
-fn train_model(sd: &HashMap<String, Matrix>, docs: &[String], tok: &Tokenizer) {
+fn train_model(sd: &HashMap<String, Matrix>, docs: &[String], tok: &Tokenizer, steps: usize) {
+    let encoded_docs: Vec<Vec<usize>> = docs.iter().map(|doc| tok.encode(doc)).collect();
     let params: Vec<ValueRef> = sd
         .values()
         .flat_map(|mat| mat.iter().flat_map(|row| row.iter().cloned()))
@@ -540,9 +578,8 @@ fn train_model(sd: &HashMap<String, Matrix>, docs: &[String], tok: &Tokenizer) {
     let mut adam_m = vec![0.0f64; n_params];
     let mut adam_v = vec![0.0f64; n_params];
 
-    for step in 0..NUM_STEPS {
-        let doc = &docs[step % docs.len()];
-        let tokens = tok.encode(doc);
+    for step in 0..steps {
+        let tokens = &encoded_docs[step % encoded_docs.len()];
         let n = BLOCK_SIZE.min(tokens.len() - 1);
 
         let mut keys: Vec<Vec<Vec<ValueRef>>> = vec![vec![]; N_LAYER];
@@ -566,7 +603,7 @@ fn train_model(sd: &HashMap<String, Matrix>, docs: &[String], tok: &Tokenizer) {
 
         loss.backward();
 
-        let lr_t = LEARNING_RATE * (1.0 - step as f64 / NUM_STEPS as f64);
+        let lr_t = LEARNING_RATE * (1.0 - step as f64 / steps as f64);
         for (i, p) in params.iter().enumerate() {
             let mut pb = p.0.borrow_mut();
             let g = pb.grad;
@@ -578,13 +615,15 @@ fn train_model(sd: &HashMap<String, Matrix>, docs: &[String], tok: &Tokenizer) {
             pb.grad = 0.0;
         }
 
-        print!(
-            "\rstep {:4} / {:4} | loss {:.4}",
-            step + 1,
-            NUM_STEPS,
-            loss.data()
-        );
-        std::io::stdout().flush().unwrap();
+        if step + 1 == steps || (step + 1) % LOG_EVERY == 0 {
+            print!(
+                "\rstep {:4} / {:4} | loss {:.4}",
+                step + 1,
+                steps,
+                loss.data()
+            );
+            std::io::stdout().flush().unwrap();
+        }
     }
 }
 
