@@ -1,0 +1,18 @@
+[package]
+name = "microgpt"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal pure Rust GPT training and inference example."
+license = "MIT"
+repository = "https://github.com/zengfengbo/microgpt"
+readme = "README.md"
+include = [
+    "src/**",
+    "data/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+]
+
+[dependencies]
+rand = "0.8"
